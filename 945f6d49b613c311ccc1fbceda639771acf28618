@@ -1,1 +1,1 @@
-Changelog: s/$/ in gen-changelog/
+Changelog: s/\.$/ in gen-changelog./
