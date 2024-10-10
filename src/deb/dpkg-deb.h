@@ -78,6 +78,7 @@ extern struct compress_params compress_params;
 
 #define DEBMAGIC		"debian-binary"
 #define ADMINMEMBER		"control.tar"
+#define PADMEMBER		"_data-pad"
 #define DATAMEMBER		"data.tar"
 
 #ifdef PATH_MAX

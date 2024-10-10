@@ -50,6 +50,8 @@
 
 #include "dpkg-deb.h"
 
+#define REFLINK_ALIGNMENT 4096
+
 static void
 movecontrolfiles(const char *dir, const char *thing)
 {
@@ -123,6 +125,8 @@ extracthalf(const char *debar, const char *dir,
     .type = COMPRESSOR_TYPE_GZIP,
     .threads_max = compress_params.threads_max,
   };
+  bool reflink = false;
+  off_t data_offset;
 
   ar = dpkg_ar_open(debar);
 
@@ -175,6 +179,8 @@ extracthalf(const char *debar, const char *dir,
       } else if (arh.ar_name[0] == '_') {
         /* Members with ‘_’ are noncritical, and if we don't understand
          * them we skip them. */
+        if (strncmp(arh.ar_name, PADMEMBER, strlen(PADMEMBER)) == 0)
+          reflink = true;
         if (fd_skip(ar->fd, memberlen + (memberlen & 1), &err) < 0)
           ohshit(_("cannot skip archive member from '%s': %s"), ar->name, err.str);
       } else {
@@ -204,12 +210,25 @@ extracthalf(const char *debar, const char *dir,
 	  if (strncmp(arh.ar_name, DATAMEMBER, strlen(DATAMEMBER)) == 0) {
 	    const char *extension = arh.ar_name + strlen(DATAMEMBER);
 
+            if (reflink) {
+              data_offset = lseek(ar->fd, 0, SEEK_CUR);
+              if (data_offset % REFLINK_ALIGNMENT != 0) {
+                notice(_("warning: archive '%s' contains reflinked members with "
+                         "misaligned data, ignoring reflinks"), debar);
+                reflink = false;
+              }
+            }
 	    adminmember= 0;
             decompress_params.type = compressor_find_by_extension(extension);
             if (decompress_params.type == COMPRESSOR_TYPE_UNKNOWN)
               ohshit(_("archive '%s' uses unknown compression for member '%.*s', "
                        "giving up"),
                      debar, (int)sizeof(arh.ar_name), arh.ar_name);
+            if (reflink && decompress_params.type != COMPRESSOR_TYPE_NONE) {
+              notice(_("warning: archive '%s' contains reflinked members with "
+                       "compression, ignoring reflinks"), debar);
+              reflink = false;
+            }
           } else {
             ohshit(_("archive '%s' has premature member '%.*s' before '%s', "
                      "giving up"),
@@ -278,6 +297,7 @@ extracthalf(const char *debar, const char *dir,
     ohshit(_("'%.255s' is not a Debian format archive"), debar);
   }
 
+  if (!reflink) {
   m_pipe(p1);
   c1 = subproc_fork();
   if (!c1) {
@@ -311,13 +331,17 @@ extracthalf(const char *debar, const char *dir,
   }
   close(p1[0]);
   dpkg_ar_close(ar);
+  }
 
   if (taroption) {
+    if (!reflink) {
     close(p2[1]);
 
     c3 = subproc_fork();
-    if (!c3) {
+    }
+    if (!c3 || reflink) {
       struct command cmd;
+      char debpath[PATH_MAX];
 
       command_init(&cmd, TAR, "tar");
       command_add_arg(&cmd, "tar");
@@ -337,11 +361,23 @@ extracthalf(const char *debar, const char *dir,
         command_add_arg(&cmd, "-m");
 
       command_add_arg(&cmd, "-f");
-      command_add_arg(&cmd, "-");
+      if (reflink) {
+        getcwd(debpath, sizeof(debpath));
+        strcat(debpath, "/");
+        strcat(debpath, debar);
+        command_add_arg(&cmd, debpath);
+
+        command_add_arg(&cmd, "--reflink");
+        command_add_arg(&cmd, str_fmt("--offset=%ld", data_offset));
+      } else
+        command_add_arg(&cmd, "-");
+
       command_add_arg(&cmd, "--warning=no-timestamp");
 
+      if (!reflink) {
       m_dup2(p2[0],0);
       close(p2[0]);
+      }
 
       unsetenv("TAR_OPTIONS");
 
@@ -359,13 +395,17 @@ extracthalf(const char *debar, const char *dir,
 
       command_exec(&cmd);
     }
+    if (!reflink) {
     close(p2[0]);
     subproc_reap(c3, "tar", 0);
+    }
   }
 
+  if (!reflink) {
   subproc_reap(c2, _("<decompress>"), SUBPROC_NOPIPE);
   if (c1 >= 0)
     subproc_reap(c1, _("paste"), 0);
+  }
   if (version.major == 0 && admininfo) {
     /* Handle the version as a float to preserve the behavior of old code,
      * because even if the format is defined to be padded by 0's that might
