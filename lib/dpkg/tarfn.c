@@ -293,12 +293,21 @@ tar_header_decode(struct tar_header *h, struct tar_entry *d, struct dpkg_error *
 	if (d->type == TAR_FILETYPE_FILE0)
 		d->type = TAR_FILETYPE_FILE;
 
-	/* Concatenate prefix and name to support ustar style long names. */
-	if (d->format == TAR_FORMAT_USTAR && h->prefix[0] != '\0')
+	if (d->paxname) {
+		d->name = d->paxname;
+		d->paxname = NULL;
+	} else if (d->format == TAR_FORMAT_USTAR && h->prefix[0] != '\0')
+		/* Concatenate prefix and name to support ustar style long names. */
 		d->name = tar_header_get_prefix_name(h);
 	else
 		d->name = m_strndup(h->name, sizeof(h->name));
-	d->linkname = m_strndup(h->linkname, sizeof(h->linkname));
+
+	if (d->paxlinkname) {
+		d->linkname = d->paxlinkname;
+		d->paxlinkname = NULL;
+	} else {
+		d->linkname = m_strndup(h->linkname, sizeof(h->linkname));
+	}
 	d->stat.mode = tar_header_get_unix_mode(h);
 	/* Even though off_t is signed, we use an unsigned parser here because
 	 * negative offsets are not allowed. */
@@ -416,6 +425,8 @@ tar_entry_destroy(struct tar_entry *te)
 	free(te->linkname);
 	free(te->stat.uname);
 	free(te->stat.gname);
+	free(te->paxname);
+	free(te->paxlinkname);
 
 	memset(te, 0, sizeof(*te));
 }
@@ -448,6 +459,74 @@ tar_entry_update_from_system(struct tar_entry *te)
 	}
 }
 
+static size_t round512(size_t size)
+{
+	return (size + 511) & ~511;
+}
+
+static int
+parse_pax_records(struct tar_archive *tar, struct tar_entry *h, char *buf, size_t size)
+{
+	char *p, *end;
+
+	p = buf;
+	end = buf + size;
+
+	while (p < end - 4) {
+		char *key, *value;
+		size_t record_len;
+
+		key = memchr(p, ' ', end - p);
+		if (!key)
+			break;
+
+		*key = 0;
+		key++;
+
+		record_len = strtoul(p, NULL, 10);
+		if (p + record_len >= end)
+			break;
+
+		value = memchr(key, '=', end - key);
+		if (!value)
+			break;
+
+		*value = 0;
+		value++;
+
+		if (p[record_len - 1] != '\n')
+			break;
+
+		p[record_len - 1] = 0;
+
+		if (strcmp(key, "path") == 0)
+			h->paxname = m_strdup(value);
+		else if (strcmp(key, "linkpath") == 0)
+			h->paxlinkname = m_strdup(value);
+
+		p += record_len;
+	}
+
+	return 0;
+
+}
+
+static int
+parse_pax_header(struct tar_archive *tar, struct tar_entry *h)
+{
+	char buf[4096 + 512];
+	size_t skip;
+	int status;
+
+	skip = round512(h->size);
+
+	status = tar->ops->read(tar, buf, skip);
+
+	parse_pax_records(tar, h, buf, skip);
+
+	return status < 0 ? status : 0;
+}
+
 int
 tar_extractor(struct tar_archive *tar)
 {
@@ -466,6 +545,8 @@ tar_extractor(struct tar_archive *tar)
 	h.linkname = NULL;
 	h.stat.uname = NULL;
 	h.stat.gname = NULL;
+	h.paxname = NULL;
+	h.paxlinkname = NULL;
 
 	while ((status = tar->ops->read(tar, buffer, TARBLKSZ)) == TARBLKSZ) {
 		int name_len;
@@ -568,11 +649,9 @@ tar_extractor(struct tar_archive *tar)
 			break;
 		case TAR_FILETYPE_PAX_GLOBAL:
 		case TAR_FILETYPE_PAX_EXTENDED:
-			status = dpkg_put_error(&tar->err,
-			                        _("unsupported PAX tar header type '%c'"),
-			                        h.type);
+			status = parse_pax_header(tar, &h);
 			errno = 0;
-			break;
+			goto reread;
 		default:
 			status = dpkg_put_error(&tar->err,
 			                        _("unknown tar header type '%c'"),
@@ -580,6 +659,8 @@ tar_extractor(struct tar_archive *tar)
 			errno = 0;
 		}
 		tar_entry_destroy(&h);
+
+reread:
 		if (status != 0)
 			/* Pass on status from coroutine. */
 			break;

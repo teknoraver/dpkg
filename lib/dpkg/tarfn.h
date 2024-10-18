@@ -85,6 +85,10 @@ struct tar_entry {
 	intmax_t mtime;
 	/** Special device for mknod(). */
 	dev_t dev;
+	/** Real file name found in PAX header. */
+	char *paxname;
+	/** Real symlink name found in PAX header. */
+	char *paxlinkname;
 
 	struct file_stat stat;
 };
