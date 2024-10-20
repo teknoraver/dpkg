@@ -37,6 +37,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <obstack.h>
 #define obstack_chunk_alloc m_malloc
 #define obstack_chunk_free free
@@ -348,6 +350,52 @@ does_replace(struct pkginfo *new_pkg, struct pkgbin *new_pkgbin,
   return false;
 }
 
+static size_t round512(size_t size) {
+  return (size + 511) & ~511;
+}
+
+static size_t round4k(size_t size) {
+  return (size + 4095) & ~4095;
+}
+
+static int
+reflink_file(int dst_fd, int src_fd, size_t size)
+{
+#ifdef FICLONERANGE
+  struct file_clone_range fcr = {
+    .src_fd = src_fd,
+    .src_length = round4k(size),
+  };
+  long rc;
+
+  if (size == 0)
+    return 0;
+
+  rc = lseek(src_fd, 0, SEEK_CUR);
+  if (rc < 0)
+      return rc;
+
+  fcr.src_offset = rc;
+
+  rc = ioctl(dst_fd, FICLONERANGE, &fcr);
+  if (rc < 0)
+      return rc;
+
+  rc = ftruncate(dst_fd, size);
+  if (rc < 0)
+      return rc;
+
+  rc = lseek(src_fd, round512(size), SEEK_CUR);
+  if (rc < 0)
+      return rc;
+
+  return 0;
+
+#else
+  return -ENOSYS;
+#endif
+}
+
 static void
 tarobject_extract(struct tarcontext *tc, struct tar_entry *te,
                   const char *path, struct file_stat *st,
@@ -360,6 +408,7 @@ tarobject_extract(struct tarcontext *tc, struct tar_entry *te,
   struct fsys_namenode *linknode;
   char *newhash;
   int rc;
+  bool reflinked = false;
 
   switch (te->type) {
   case TAR_FILETYPE_FILE:
@@ -372,6 +421,13 @@ tarobject_extract(struct tarcontext *tc, struct tar_entry *te,
     push_cleanup(cu_closefd, ehflag_bombout, 1, &fd);
     debug(dbg_eachfiledetail, "tarobject file open size=%jd",
           (intmax_t)te->size);
+
+    /* We try to use the reflink ioctl to avoid copying the data. */
+    rc = reflink_file(fd, tc->backendpipe, te->size);
+    if (!rc) {
+      /* reflink succeeded, no need to fsync. */
+      reflinked = true;
+    } else {
 
     /* We try to tell the filesystem how much disk space we are going to
      * need to let it reduce fragmentation and possibly improve performance,
@@ -388,6 +444,7 @@ tarobject_extract(struct tarcontext *tc, struct tar_entry *te,
     tarobject_skip_padding(tc, te);
 
     fd_writeback_init(fd);
+    }
 
     if (namenode->statoverride)
       debug(dbg_eachfile, "tarobject ... stat override, uid=%d, gid=%d, mode=%04o",
@@ -402,7 +459,7 @@ tarobject_extract(struct tarcontext *tc, struct tar_entry *te,
       ohshite(_("error setting permissions of '%.255s'"), te->name);
 
     /* Postpone the fsync, to try to avoid massive I/O degradation. */
-    if (!in_force(FORCE_UNSAFE_IO))
+    if (!reflinked && !in_force(FORCE_UNSAFE_IO))
       namenode->flags |= FNNF_DEFERRED_FSYNC;
 
     pop_cleanup(ehflag_normaltidy); /* fd = open(path) */
