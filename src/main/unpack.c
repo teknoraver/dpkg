@@ -55,6 +55,7 @@
 #include <dpkg/db-ctrl.h>
 #include <dpkg/db-fsys.h>
 #include <dpkg/triglib.h>
+#include <dpkg/ar.h>
 
 #include "file-match.h"
 #include "main.h"
@@ -1192,6 +1193,82 @@ pkg_remove_backup_files(struct pkginfo *pkg, struct fsys_namenode_list *newfiles
   }
 }
 
+static ssize_t
+read_line(int fd, char *buf, size_t min_size, size_t max_size)
+{
+  ssize_t line_size = 0;
+  size_t n = min_size;
+
+  while (line_size < (ssize_t)max_size) {
+    ssize_t nread;
+    char *nl;
+
+    nread = read(fd, buf + line_size, n);
+    if (nread <= 0)
+      return nread;
+
+    nl = memchr(buf + line_size, '\n', nread);
+    line_size += nread;
+
+    if (nl != NULL) {
+      nl[1] = '\0';
+      return line_size;
+    }
+
+    n = 1;
+  }
+
+  buf[line_size] = '\0';
+  return line_size;
+}
+
+static int data_offset(const char *debar) {
+  struct dpkg_ar *ar;
+  char versionbuf[40];
+  off_t memberlen;
+  ssize_t rc;
+  off_t offset = -1;
+
+  ar = dpkg_ar_open(debar);
+
+  rc = read_line(ar->fd, versionbuf, strlen(DPKG_AR_MAGIC), sizeof(versionbuf) - 1);
+  if (rc <= 0)
+    ohshite(_("read failed"));
+
+  if (strcmp(versionbuf, DPKG_AR_MAGIC))
+    ohshite(_("archive magic version number"));
+
+  for (;;) {
+    struct dpkg_ar_hdr arh;
+
+    rc = read(ar->fd, &arh, sizeof(arh));
+    if (rc != sizeof(arh))
+      ohshite(_("archive member header"));
+
+    if (dpkg_ar_member_is_illegal(&arh))
+      ohshite(_("file '%.250s' is corrupt - bad archive header magic"), debar);
+
+    dpkg_ar_normalize_name(&arh);
+
+    if (strcmp(arh.ar_name, "data.tar") == 0) {
+      offset = lseek(ar->fd, 0, SEEK_CUR);
+      break;
+    }
+
+    memberlen = dpkg_ar_member_get_size(ar, &arh);
+
+    if (memberlen %2)
+      memberlen++;
+
+    lseek(ar->fd, memberlen, SEEK_CUR);
+  }
+
+  close(ar->fd);
+  free(ar);
+
+  return offset;
+}
+
 void process_archive(const char *filename) {
   static const struct tar_operations tf = {
     .read = tarfileread,
@@ -1223,6 +1300,7 @@ void process_archive(const char *filename) {
   const char *pfilename;
   struct fsys_namenode_queue newconffiles, newfiles_queue;
   struct stat stab;
+  size_t data_tar_offset;
 
   cleanup_pkg_failed= cleanup_conflictor_failed= 0;
 
@@ -1536,6 +1614,9 @@ void process_archive(const char *filename) {
    * files get replaced ‘as we go’.
    */
 
+  data_tar_offset = data_offset(filename);
+
+/*
   m_pipe(p1);
   push_cleanup(cu_closepipe, ehflag_bombout, 1, (void *)&p1[0]);
   pid = subproc_fork();
@@ -1547,13 +1628,15 @@ void process_archive(const char *filename) {
   }
   close(p1[1]);
   p1[1] = -1;
+*/
 
   newfiles_queue.head = NULL;
   newfiles_queue.tail = &newfiles_queue.head;
   tc.newfiles_queue = &newfiles_queue;
   push_cleanup(cu_fileslist, ~0, 0);
   tc.pkg= pkg;
-  tc.backendpipe= p1[0];
+  tc.backendpipe= open(filename, O_RDONLY); //p1[0];
+  lseek(tc.backendpipe, data_tar_offset, SEEK_SET);
   tc.pkgset_getting_in_sync = pkgset_getting_in_sync(pkg);
 
   /* Setup the tar archive. */
@@ -1565,11 +1648,14 @@ void process_archive(const char *filename) {
   if (rc)
     dpkg_error_print(&tar.err,
                      _("corrupted filesystem tarfile in package archive"));
+
+/*
   if (fd_skip(p1[0], -1, &err) < 0)
     ohshit(_("cannot zap possible trailing zeros from dpkg-deb: %s"), err.str);
   close(p1[0]);
   p1[0] = -1;
   subproc_reap(pid, BACKEND " --fsys-tarfile", SUBPROC_NOPIPE);
+*/
 
   tar_deferred_extract(newfiles_queue.head, pkg);
 
