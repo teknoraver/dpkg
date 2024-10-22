@@ -55,6 +55,7 @@
 #include <dpkg/db-ctrl.h>
 #include <dpkg/db-fsys.h>
 #include <dpkg/triglib.h>
+#include <dpkg/ar.h>
 
 #include "file-match.h"
 #include "main.h"
@@ -1223,6 +1224,7 @@ void process_archive(const char *filename) {
   const char *pfilename;
   struct fsys_namenode_queue newconffiles, newfiles_queue;
   struct stat stab;
+  off_t data_tar_offset;
 
   cleanup_pkg_failed= cleanup_conflictor_failed= 0;
 
@@ -1536,24 +1538,33 @@ void process_archive(const char *filename) {
    * files get replaced ‘as we go’.
    */
 
-  m_pipe(p1);
-  push_cleanup(cu_closepipe, ehflag_bombout, 1, (void *)&p1[0]);
-  pid = subproc_fork();
-  if (pid == 0) {
-    m_dup2(p1[1],1); close(p1[0]); close(p1[1]);
-    execlp(BACKEND, BACKEND, "--fsys-tarfile", filename, NULL);
-    ohshite(_("unable to execute %s (%s)"),
-            _("package filesystem archive extraction"), BACKEND);
+  data_tar_offset = dpkg_ar_member_get_offset(filename);
+
+  if (data_tar_offset < 0) {
+    m_pipe(p1);
+    push_cleanup(cu_closepipe, ehflag_bombout, 1, (void *)&p1[0]);
+    pid = subproc_fork();
+    if (pid == 0) {
+      m_dup2(p1[1],1); close(p1[0]); close(p1[1]);
+      execlp(BACKEND, BACKEND, "--fsys-tarfile", filename, NULL);
+      ohshite(_("unable to execute %s (%s)"),
+              _("package filesystem archive extraction"), BACKEND);
+    }
+    close(p1[1]);
+    p1[1] = -1;
   }
-  close(p1[1]);
-  p1[1] = -1;
 
   newfiles_queue.head = NULL;
   newfiles_queue.tail = &newfiles_queue.head;
   tc.newfiles_queue = &newfiles_queue;
   push_cleanup(cu_fileslist, ~0, 0);
   tc.pkg= pkg;
-  tc.backendpipe= p1[0];
+  if (data_tar_offset < 0) {
+    tc.backendpipe= p1[0];
+  } else {
+    tc.backendpipe= open(filename, O_RDONLY);
+    lseek(tc.backendpipe, data_tar_offset, SEEK_SET);
+  }
   tc.pkgset_getting_in_sync = pkgset_getting_in_sync(pkg);
 
   /* Setup the tar archive. */
@@ -1565,11 +1576,14 @@ void process_archive(const char *filename) {
   if (rc)
     dpkg_error_print(&tar.err,
                      _("corrupted filesystem tarfile in package archive"));
-  if (fd_skip(p1[0], -1, &err) < 0)
-    ohshit(_("cannot zap possible trailing zeros from dpkg-deb: %s"), err.str);
-  close(p1[0]);
-  p1[0] = -1;
-  subproc_reap(pid, BACKEND " --fsys-tarfile", SUBPROC_NOPIPE);
+
+  if (data_tar_offset < 0) {
+    if (fd_skip(p1[0], -1, &err) < 0)
+      ohshit(_("cannot zap possible trailing zeros from dpkg-deb: %s"), err.str);
+    close(p1[0]);
+    p1[0] = -1;
+    subproc_reap(pid, BACKEND " --fsys-tarfile", SUBPROC_NOPIPE);
+  }
 
   tar_deferred_extract(newfiles_queue.head, pkg);
 
