@@ -74,35 +74,6 @@ read_fail(int rc, const char *filename, const char *what)
     ohshite(_("error reading %s from file %.255s"), what, filename);
 }
 
-static ssize_t
-read_line(int fd, char *buf, size_t min_size, size_t max_size)
-{
-  ssize_t line_size = 0;
-  size_t n = min_size;
-
-  while (line_size < (ssize_t)max_size) {
-    ssize_t nread;
-    char *nl;
-
-    nread = fd_read(fd, buf + line_size, n);
-    if (nread <= 0)
-      return nread;
-
-    nl = memchr(buf + line_size, '\n', nread);
-    line_size += nread;
-
-    if (nl != NULL) {
-      nl[1] = '\0';
-      return line_size;
-    }
-
-    n = 1;
-  }
-
-  buf[line_size] = '\0';
-  return line_size;
-}
-
 void
 extracthalf(const char *debar, const char *dir,
             enum dpkg_tar_options taroption, int admininfo)

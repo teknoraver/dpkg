@@ -76,6 +76,8 @@ struct dpkg_ar_member {
 	gid_t gid;
 };
 
+ssize_t read_line(int fd, char *buf, size_t min_size, size_t max_size);
+
 struct dpkg_ar *
 dpkg_ar_fdopen(const char *filename, int fd);
 struct dpkg_ar *dpkg_ar_open(const char *filename);
@@ -95,6 +97,7 @@ void dpkg_ar_member_put_mem(struct dpkg_ar *ar, const char *name,
                             const void *data, size_t size);
 off_t dpkg_ar_member_get_size(struct dpkg_ar *ar, struct dpkg_ar_hdr *arh);
 
+off_t dpkg_ar_member_get_offset(const char *debar);
 /** @} */
 
 DPKG_END_DECLS

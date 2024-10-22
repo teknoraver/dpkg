@@ -232,3 +232,77 @@ dpkg_ar_member_put_file(struct dpkg_ar *ar,
 		if (fd_write(ar->fd, "\n", 1) < 0)
 			ohshite(_("unable to write file '%s'"), ar->name);
 }
+
+ssize_t read_line(int fd, char *buf, size_t min_size, size_t max_size)
+{
+	ssize_t line_size = 0;
+	size_t n = min_size;
+
+	while (line_size < (ssize_t) max_size) {
+		ssize_t nread;
+		char *nl;
+
+		nread = fd_read(fd, buf + line_size, n);
+		if (nread <= 0)
+			return nread;
+
+		nl = memchr(buf + line_size, '\n', nread);
+		line_size += nread;
+
+		if (nl != NULL) {
+			nl[1] = '\0';
+			return line_size;
+		}
+
+		n = 1;
+	}
+
+	buf[line_size] = '\0';
+	return line_size;
+}
+
+off_t dpkg_ar_member_get_offset(const char *debar)
+{
+	struct dpkg_ar ar = { .name = debar };
+	char versionbuf[sizeof(DPKG_AR_MAGIC)];
+	off_t memberlen;
+	ssize_t rc;
+	off_t offset = -1;
+
+	ar.fd = open(ar.name, O_RDONLY);
+	if (ar.fd < 0)
+		ohshite(_("failed to open archive '%.255s'"), debar);
+
+	rc = read_line(ar.fd, versionbuf, sizeof(DPKG_AR_MAGIC) - 1,
+		       sizeof(versionbuf));
+	if (rc <= 0)
+		ohshite(_("read failed"));
+	if (strcmp(versionbuf, DPKG_AR_MAGIC))
+		ohshite(_("archive magic version number"));
+
+	for (;;) {
+		struct dpkg_ar_hdr arh;
+
+		rc = read(ar.fd, &arh, sizeof(arh));
+		if (rc != sizeof(arh))
+			break;
+
+		if (dpkg_ar_member_is_illegal(&arh))
+			ohshite(_("file '%.250s' is corrupt - bad archive header magic"),
+				debar);
+
+		dpkg_ar_normalize_name(&arh);
+		if (strcmp(arh.ar_name, "data.tar") == 0) {
+			offset = lseek(ar.fd, 0, SEEK_CUR);
+			break;
+		}
+
+		memberlen = dpkg_ar_member_get_size(&ar, &arh);
+		if (memberlen % 2)
+			memberlen++;
+		lseek(ar.fd, memberlen, SEEK_CUR);
+	}
+
+	close(ar.fd);
+	return offset;
+}
